@@ -14,14 +14,15 @@ import { URI } from '../../../../base/common/uri.js';
 import { generateUuid } from '../../../../base/common/uuid.js';
 import { formatSubprocessArguments } from '../../../../base/node/processes.js';
 import { ILogService } from '../../../log/common/log.js';
-import { ACP_AGENT_PROVIDER_PREFIX, type AgentChatMigrationResult, AgentPermissionKind, type AgentSignal, type IActiveClient, type IAgent, type IAgentChatConfigCompletionsParams, type IAgentChatContext, type IAgentChatMetadata, type IAgentChats, type IAgentCreateChatOptions, type IAgentCreateChatResult, type IAgentDescriptor, type IAgentDiscoveredChat, type IAgentModelInfo, type IAgentPermissionResponseContext, type IAgentResolveChatConfigParams, type IAgentToolPendingConfirmationSignal } from '../../common/agent.js';
+import { ACP_AGENT_PROVIDER_PREFIX, type AgentChatMigrationResult, AgentPermissionKind, AgentSession, type AgentSignal, type IActiveClient, type IAgent, type IAgentChatConfigCompletionsParams, type IAgentChatContext, type IAgentChatMetadata, type IAgentChats, type IAgentCreateChatOptions, type IAgentCreateChatResult, type IAgentDescriptor, type IAgentDiscoveredChat, type IAgentModelInfo, type IAgentPermissionResponseContext, type IAgentResolveChatConfigParams, type IAgentToolPendingConfirmationSignal, resolveAgentChatContext } from '../../common/agent.js';
+import { deriveLegacyDefaultChat } from '../../common/agentHostLegacyDefaultChat.js';
 import type { IAgentHostAcpAgentConfig } from '../../common/agentHostSchema.js';
 import type { ResolveSessionConfigResult, SessionConfigCompletionsResult } from '../../common/state/protocol/commands.js';
 import type { AgentSelection, MessageAttachment, ModelSelection } from '../../common/state/protocol/state.js';
 import { MessageAttachmentKind, ToolCallStatus, type Customization, type Turn } from '../../common/state/sessionState.js';
 import { transportFromChildProcess } from '../codex/codexAppServerClient.js';
 import { AcpClient, type IAcpClient, type IAcpTransport } from './acpClient.js';
-import { ACP_AUTH_REQUIRED_ERROR_CODE, ACP_PROTOCOL_VERSION, type AcpContentBlock, type IAcpAuthMethod, type IAcpInitializeResult, type IAcpPermissionOption, type IAcpRequestPermissionParams, type IAcpRequestPermissionResult, type IAcpSessionConfigOption, type IAcpSessionNotification, type IAcpSessionSetup } from './acpProtocol.js';
+import { ACP_AUTH_REQUIRED_ERROR_CODE, ACP_PROTOCOL_VERSION, type AcpContentBlock, type IAcpAuthMethod, type IAcpInitializeResult, type IAcpPermissionOption, type IAcpRequestPermissionParams, type IAcpRequestPermissionResult, type IAcpSessionConfigOption, type IAcpSessionInfo, type IAcpSessionNotification, type IAcpSessionSetup } from './acpProtocol.js';
 import { AcpTurnMapper } from './acpTurnMapper.js';
 
 export function acpProviderId(config: Pick<IAgentHostAcpAgentConfig, 'id'>): string {
@@ -113,6 +114,8 @@ export class AcpAgent extends Disposable implements IAgent {
 	private readonly _chats = new Map<string, IAcpChatState>();
 	private readonly _chatBySessionId = new Map<string, IAcpChatState>();
 	private readonly _pendingPermissions = new Map<string, IPendingPermission>();
+	/** The host session URI behind an ACP session id, for sessions this host created, so discovery does not re-register them under the agent's id. */
+	private readonly _hostSessionByAcpId = new Map<string, URI>();
 
 	constructor(
 		private readonly _config: IAgentHostAcpAgentConfig,
@@ -267,6 +270,7 @@ export class AcpAgent extends Disposable implements IAgent {
 			throw this._describeError(error, connection);
 		}
 		const state = this._track(chat, result.sessionId, cwd, connection);
+		this._noteHostSession(result.sessionId, resolveAgentChatContext(_context, chat).owner.get());
 		try {
 			this._applySetup(state, result);
 			if (options?.model) {
@@ -281,13 +285,25 @@ export class AcpAgent extends Disposable implements IAgent {
 		return { providerData: JSON.stringify(providerData), resolvedWorkingDirectory: URI.file(cwd) };
 	}
 
-	async materializeChat(chat: URI, _context: URI | IAgentChatContext, providerData: string | undefined): Promise<void> {
+	async materializeChat(chat: URI, context: URI | IAgentChatContext, providerData: string | undefined): Promise<IAgentCreateChatResult | void> {
 		if (this._chats.has(chat.toString())) {
 			return;
 		}
-		const data = parseProviderData(providerData);
-		if (!data) {
-			throw new Error(`${this._displayName} has no session to restore for ${chat.toString()}.`);
+		const hostSession = resolveAgentChatContext(context, chat).owner.get();
+		let data = parseProviderData(providerData);
+		let recovered = false;
+		if (data) {
+			this._noteHostSession(data.sessionId, hostSession);
+		} else {
+			// A discovered session has no persisted provider data: recover the working
+			// directory from the agent's own session list and persist it for later restores.
+			const acpId = this._acpIdForSession(hostSession);
+			const info = acpId !== undefined ? await this._findListedSession(acpId) : undefined;
+			if (!info || !info.cwd) {
+				throw new Error(`${this._displayName} has no session to restore for ${chat.toString()}.`);
+			}
+			data = { sessionId: info.sessionId, cwd: info.cwd };
+			recovered = true;
 		}
 		const state = this._track(chat, data.sessionId, data.cwd, undefined);
 		try {
@@ -297,7 +313,100 @@ export class AcpAgent extends Disposable implements IAgent {
 			this._untrack(state);
 			throw error;
 		}
+		return recovered ? { providerData: JSON.stringify(data) } : undefined;
 	}
+
+	// #region External chat discovery
+
+	/** The most `session/list` pages one discovery pass reads before reporting the catalog truncated. */
+	private static readonly LIST_SESSIONS_MAX_PAGES = 100;
+
+	startChatDiscovery(): Promise<void> {
+		return this._runChatDiscovery();
+	}
+
+	async discoverChat(session: URI): Promise<IAgentDiscoveredChat | undefined> {
+		const acpId = this._acpIdForSession(session);
+		const info = acpId !== undefined ? await this._findListedSession(acpId) : undefined;
+		return info ? this._toDiscoveredChat(info) : undefined;
+	}
+
+	private async _runChatDiscovery(): Promise<void> {
+		const listed = await this._listAllSessions();
+		if (!listed) {
+			return;
+		}
+		const discovered: IAgentDiscoveredChat[] = [];
+		for (const info of listed) {
+			const entry = this._toDiscoveredChat(info);
+			if (entry) {
+				discovered.push(entry);
+			}
+		}
+		if (discovered.length > 0) {
+			this._onDidDiscoverChats.fire(discovered);
+		}
+	}
+
+	/** Every session the agent reports, following `nextCursor`; `undefined` when the agent cannot enumerate. */
+	private async _listAllSessions(): Promise<readonly IAcpSessionInfo[] | undefined> {
+		const connection = await this._getConnection();
+		if (!connection.initialize.agentCapabilities?.sessionCapabilities?.list) {
+			return undefined;
+		}
+		const listed: IAcpSessionInfo[] = [];
+		let cursor: string | null | undefined;
+		for (let page = 0; page < AcpAgent.LIST_SESSIONS_MAX_PAGES; page++) {
+			const result = await connection.client.request('session/list', { cursor });
+			listed.push(...result.sessions);
+			cursor = result.nextCursor ?? null;
+			if (cursor === null) {
+				return listed;
+			}
+		}
+		this._logService.warn(`[ACP:${this._config.id}] session/list did not finish after ${AcpAgent.LIST_SESSIONS_MAX_PAGES} pages; later sessions are missing`);
+		return listed;
+	}
+
+	private async _findListedSession(acpId: string): Promise<IAcpSessionInfo | undefined> {
+		const listed = await this._listAllSessions();
+		return listed?.find(info => info.sessionId === acpId);
+	}
+
+	/** The ACP session id behind a host session URI: the recorded one, or the URI's id for sessions minted from discovery. */
+	private _acpIdForSession(session: URI): string | undefined {
+		for (const [acpId, hostSession] of this._hostSessionByAcpId) {
+			if (hostSession.toString() === session.toString()) {
+				return acpId;
+			}
+		}
+		return session.scheme === this.id ? AgentSession.id(session) : undefined;
+	}
+
+	private _toDiscoveredChat(info: IAcpSessionInfo): IAgentDiscoveredChat | undefined {
+		if (!info.sessionId) {
+			return undefined;
+		}
+		const hostSession = this._hostSessionByAcpId.get(info.sessionId);
+		const session = hostSession ?? AgentSession.uri(this.id, info.sessionId);
+		const updatedAt = info.updatedAt ? Date.parse(info.updatedAt) : NaN;
+		const modifiedTime = Number.isFinite(updatedAt) ? updatedAt : Date.now();
+		return {
+			chat: URI.parse(deriveLegacyDefaultChat(session)),
+			startTime: modifiedTime,
+			modifiedTime,
+			...(info.title ? { summary: info.title } : {}),
+			...(info.cwd ? { workingDirectories: [URI.file(info.cwd)] } : {}),
+			session,
+			external: hostSession === undefined,
+		};
+	}
+
+	private _noteHostSession(acpId: string, hostSession: URI): void {
+		this._hostSessionByAcpId.set(acpId, hostSession);
+	}
+
+	// #endregion
 
 	private _track(chat: URI, sessionId: string, cwd: string, connection: IAcpConnection | undefined): IAcpChatState {
 		const now = Date.now();
