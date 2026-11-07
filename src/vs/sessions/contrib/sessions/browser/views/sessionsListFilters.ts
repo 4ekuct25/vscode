@@ -55,16 +55,30 @@ export function getSessionEnvironments(environments: readonly ISessionEnvironmen
 	return [...byId.values()].sort(compareSessionEnvironments);
 }
 
+/** The harnesses the filter always offers, in this order. */
+const KNOWN_HARNESSES = [
+	{ id: 'copilot', label: localize('harness.copilot', "Copilot") },
+	{ id: 'claude', label: localize('harness.claude', "Claude") },
+	{ id: 'codex', label: localize('harness.codex', "Codex") },
+] as const;
+
 /**
  * The filter options for the given sessions. Only sessions the list includes, as
- * decided by `isSessionListed`, contribute their creating applications.
+ * decided by `isSessionListed`, contribute their creating applications and,
+ * beyond the known set, their harness.
  */
 export function getSessionFilterOptions(sessions: readonly ISession[], environments: readonly ISessionEnvironment[], isSessionListed: (session: ISession, reader: IReader | undefined) => boolean, reader?: IReader): ISessionFilterOption[] {
-	const options: ISessionFilterOption[] = [
-		{ filter: { kind: 'harness', id: 'copilot' }, label: localize('harness.copilot', "Copilot"), group: '1_harnesses' },
-		{ filter: { kind: 'harness', id: 'claude' }, label: localize('harness.claude', "Claude"), group: '1_harnesses' },
-		{ filter: { kind: 'harness', id: 'codex' }, label: localize('harness.codex', "Codex"), group: '1_harnesses' },
-	];
+	const options: ISessionFilterOption[] = KNOWN_HARNESSES.map(({ id, label }) => ({ filter: { kind: 'harness', id }, label, group: '1_harnesses' }));
+	const known = new Set<string>(KNOWN_HARNESSES.map(({ id }) => id));
+	const listed = new Set<string>();
+	for (const session of sessions) {
+		if (isSessionListed(session, reader) && !known.has(session.harness)) {
+			listed.add(session.harness);
+		}
+	}
+	for (const id of [...listed].sort((a, b) => a.localeCompare(b))) {
+		options.push({ filter: { kind: 'harness', id }, label: id, group: '1_harnesses' });
+	}
 	const ordered = getSessionEnvironments(environments);
 	for (const environment of ordered) {
 		if (environment.isConnected?.read(reader) !== false) {

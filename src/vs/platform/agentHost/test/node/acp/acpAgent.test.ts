@@ -12,7 +12,8 @@ import { join } from '../../../../../base/common/path.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { NullLogService } from '../../../../log/common/log.js';
-import { AgentPermissionKind, type AgentSignal } from '../../../common/agent.js';
+import { AgentPermissionKind, type AgentSignal, type IAgentDiscoveredChat } from '../../../common/agent.js';
+import { deriveLegacyDefaultChat } from '../../../common/agentHostLegacyDefaultChat.js';
 import { ActionType } from '../../../common/state/sessionActions.js';
 import { AcpAgent, choosePermissionOption, describeAuthRequired, modelsFromConfigOptions } from '../../../node/acp/acpAgent.js';
 import { FakeAcpAgentProcess } from './acpTestUtils.js';
@@ -209,6 +210,114 @@ suite('AcpAgent', () => {
 		await agentProcess.nextMessage('session/prompt');
 		agentProcess.exit(1);
 		await untilSignal(s => s.kind === 'action' && s.action.type === ActionType.ChatError);
+	});
+
+	test('discovers external sessions from session/list with cursor pagination', async () => {
+		const cursors: (string | undefined)[] = [];
+		agentProcess.handlers.set('session/list', params => {
+			cursors.push(params.cursor as string | undefined);
+			return params.cursor
+				? { sessions: [{ sessionId: 'ext-2', cwd: workspace, updatedAt: '2026-11-06T09:00:00.000Z' }] }
+				: { sessions: [{ sessionId: 'ext-1', cwd: workspace, title: 'First', updatedAt: '2026-11-07T10:00:00.000Z' }], nextCursor: 'page-2' };
+		});
+		const batches: (readonly IAgentDiscoveredChat[])[] = [];
+		const listener = agent.onDidDiscoverChats(chats => batches.push(chats));
+		try {
+			await agent.startChatDiscovery();
+			assert.deepStrictEqual(cursors, [undefined, 'page-2']);
+			assert.strictEqual(batches.length, 1);
+			assert.deepStrictEqual(batches[0].map(entry => ({
+				chat: entry.chat.toString(),
+				startTime: entry.startTime,
+				modifiedTime: entry.modifiedTime,
+				...(entry.summary !== undefined ? { summary: entry.summary } : {}),
+				workingDirectories: entry.workingDirectories?.map(directory => directory.toString()),
+				session: entry.session.toString(),
+				external: entry.external,
+			})), [
+				{
+					chat: URI.parse(deriveLegacyDefaultChat(URI.parse('acp-qwen:/ext-1'))).toString(),
+					startTime: Date.parse('2026-11-07T10:00:00.000Z'),
+					modifiedTime: Date.parse('2026-11-07T10:00:00.000Z'),
+					summary: 'First',
+					workingDirectories: [URI.file(workspace).toString()],
+					session: 'acp-qwen:/ext-1',
+					external: true,
+				},
+				{
+					chat: URI.parse(deriveLegacyDefaultChat(URI.parse('acp-qwen:/ext-2'))).toString(),
+					startTime: Date.parse('2026-11-06T09:00:00.000Z'),
+					modifiedTime: Date.parse('2026-11-06T09:00:00.000Z'),
+					workingDirectories: [URI.file(workspace).toString()],
+					session: 'acp-qwen:/ext-2',
+					external: true,
+				},
+			]);
+		} finally {
+			listener.dispose();
+		}
+	});
+
+	test('leaves discovery silent when the agent does not advertise session/list', async () => {
+		agentProcess.handlers.set('initialize', () => ({ protocolVersion: 1, agentCapabilities: { loadSession: true } }));
+		let fired = false;
+		const listener = agent.onDidDiscoverChats(() => fired = true);
+		try {
+			await agent.startChatDiscovery();
+			assert.strictEqual(fired, false);
+			assert.ok(!agentProcess.received.some(m => m.method === 'session/list'));
+		} finally {
+			listener.dispose();
+		}
+	});
+
+	test('lists host-created sessions under their host session, not the agent id', async () => {
+		agentProcess.handlers.set('session/list', () => ({ sessions: [{ sessionId: 'native-1', cwd: workspace, updatedAt: '2026-11-07T10:00:00.000Z' }] }));
+		await createChat();
+		const batches: (readonly IAgentDiscoveredChat[])[] = [];
+		const listener = agent.onDidDiscoverChats(chats => batches.push(chats));
+		try {
+			await agent.startChatDiscovery();
+			assert.strictEqual(batches.length, 1);
+			assert.deepStrictEqual(batches[0], [{
+				chat: URI.parse(deriveLegacyDefaultChat(session)),
+				startTime: Date.parse('2026-11-07T10:00:00.000Z'),
+				modifiedTime: Date.parse('2026-11-07T10:00:00.000Z'),
+				workingDirectories: [URI.file(workspace)],
+				session,
+				external: false,
+			}]);
+		} finally {
+			listener.dispose();
+		}
+	});
+
+	test('restores a discovered session from the agent session list and persists its provider data', async () => {
+		agentProcess.handlers.set('session/resume', () => ({ configOptions: [modelOption] }));
+		agentProcess.handlers.set('session/list', () => ({ sessions: [{ sessionId: 'ext-1', cwd: workspace }] }));
+		const externalSession = URI.parse('acp-qwen:/ext-1');
+		const externalChat = URI.parse(deriveLegacyDefaultChat(externalSession));
+		const result = await agent.materializeChat(externalChat, externalSession, undefined);
+		assert.deepStrictEqual(agentProcess.received.map(m => m.method), ['initialize', 'session/list', 'session/resume']);
+		assert.deepStrictEqual(agentProcess.received.at(-1)!.params, { sessionId: 'ext-1', cwd: workspace, mcpServers: [] });
+		assert.deepStrictEqual(result, { providerData: JSON.stringify({ sessionId: 'ext-1', cwd: workspace }) });
+		assert.ok(await agent.getChatMetadata(externalChat));
+	});
+
+	test('fails to restore a session the agent does not list', async () => {
+		agentProcess.handlers.set('session/list', () => ({ sessions: [] }));
+		const gone = URI.parse('acp-qwen:/gone');
+		await assert.rejects(agent.materializeChat(URI.parse(deriveLegacyDefaultChat(gone)), gone, undefined), /no session to restore/);
+	});
+
+	test('classifies one session for explicit import', async () => {
+		agentProcess.handlers.set('session/list', () => ({ sessions: [{ sessionId: 'ext-1', cwd: workspace, title: 'First' }] }));
+		const entry = await agent.discoverChat(URI.parse('acp-qwen:/ext-1'));
+		assert.strictEqual(entry?.session.toString(), 'acp-qwen:/ext-1');
+		assert.strictEqual(entry?.external, true);
+		assert.strictEqual(entry?.summary, 'First');
+		assert.strictEqual(await agent.discoverChat(URI.parse('acp-qwen:/missing')), undefined);
+		assert.strictEqual(await agent.discoverChat(URI.parse('other-scheme:/ext-1')), undefined);
 	});
 });
 

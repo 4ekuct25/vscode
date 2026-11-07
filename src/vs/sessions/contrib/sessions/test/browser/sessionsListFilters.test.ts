@@ -33,6 +33,37 @@ suite('SessionsListFilters', () => {
 		]);
 	});
 
+	test('offers the harnesses of listed sessions beyond the known set', () => {
+		const sessions = [
+			buildTestSession({ id: 'acp-1', title: 'Acp One', harness: 'acp-qwen' }).session,
+			buildTestSession({ id: 'acp-2', title: 'Acp Two', harness: 'acp-qwen' }).session,
+			buildTestSession({ id: 'acp-3', title: 'Acp Three', harness: 'acp-opencode' }).session,
+		];
+		assert.deepStrictEqual(getSessionFilterOptions(sessions, [], listAll).filter(option => option.filter.kind === 'harness'), [
+			{ filter: { kind: 'harness', id: 'copilot' }, label: 'Copilot', group: '1_harnesses' },
+			{ filter: { kind: 'harness', id: 'claude' }, label: 'Claude', group: '1_harnesses' },
+			{ filter: { kind: 'harness', id: 'codex' }, label: 'Codex', group: '1_harnesses' },
+			{ filter: { kind: 'harness', id: 'acp-opencode' }, label: 'acp-opencode', group: '1_harnesses' },
+			{ filter: { kind: 'harness', id: 'acp-qwen' }, label: 'acp-qwen', group: '1_harnesses' },
+		]);
+	});
+
+	test('offers a harness only while the list includes its sessions', () => {
+		const session = buildTestSession({ id: 'acp-1', title: 'Acp One', harness: 'acp-qwen' }).session;
+		const shownIds = observableValue<ReadonlySet<string>>('shownIds', new Set());
+		const snapshots: string[][] = [];
+		store.add(autorun(reader => {
+			snapshots.push(getSessionFilterOptions([session], [], (s, reader) => shownIds.read(reader).has(s.sessionId), reader)
+				.filter(option => option.filter.kind === 'harness')
+				.map(option => option.filter.id));
+		}));
+		shownIds.set(new Set(['acp-1']), undefined);
+		assert.deepStrictEqual(snapshots, [
+			['copilot', 'claude', 'codex'],
+			['copilot', 'claude', 'codex', 'acp-qwen'],
+		]);
+	});
+
 	test('offers VS Code for connected hosts without sessions and for disconnected hosts with cached applications', () => {
 		const disconnected = observableValue('disconnected', false);
 		const sessions = [
